@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=xWaydroid
+GenericName=Android on X11
+Comment=Run Waydroid (Android) on any X11 desktop
+Exec=xwaydroid
+Icon=xwaydroid
+Terminal=false
+Categories=System;Emulator;
+Keywords=android;waydroid;x11;weston;emulator;apps;
+StartupNotify=true
+Actions=Fullscreen;Stop;
+
+[Desktop Action Fullscreen]
+Name=Start Fullscreen
+Exec=xwaydroid --fullscreen
+
+[Desktop Action Stop]
+Name=Stop Android
+Exec=xwaydroid stop

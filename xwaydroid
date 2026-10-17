@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+# xwaydroid - run Waydroid on any X11 desktop.
+#
+# Waydroid needs a Wayland compositor. On an X11 session there is none, so
+# xwaydroid starts a nested Weston window on top of X11, points Waydroid at
+# it, opens the full Android UI and cleans everything up when you close it.
+#
+# https://github.com/P0r0ro/xWaydroid
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# shellcheck disable=SC2015  # "check && ok || fail" is intended; ok/warn always succeed
+set -uo pipefail
+
+VERSION="1.0.0"
+PROG="xwaydroid"
+REPO_URL="https://github.com/P0r0ro/xWaydroid"
+
+# ---------------------------------------------------------------------------
+# Defaults (override in ~/.config/xwaydroid/config or with CLI flags)
+# ---------------------------------------------------------------------------
+WIDTH="${XWAYDROID_WIDTH:-1280}"
+HEIGHT="${XWAYDROID_HEIGHT:-800}"
+FULLSCREEN="${XWAYDROID_FULLSCREEN:-0}"
+WESTON_SHELL="${XWAYDROID_SHELL:-kiosk}"      # kiosk | desktop
+RENDERER="${XWAYDROID_RENDERER:-auto}"        # auto | pixman
+STOP_ON_EXIT="${XWAYDROID_STOP_ON_EXIT:-1}"   # stop the Android session when the window closes
+SOCKET_NAME="${XWAYDROID_SOCKET:-xwaydroid-0}"
+APP=""
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/xwaydroid/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/xwaydroid"
+LOG_FILE="$STATE_DIR/weston.log"
+
+# shellcheck source=/dev/null
+[[ -f "$CONFIG_FILE" ]] && . "$CONFIG_FILE"
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+    C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_GREEN=$'\e[32m'; C_YELLOW=$'\e[33m'; C_RED=$'\e[31m'; C_CYAN=$'\e[36m'
+else
+    C_RESET=""; C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_CYAN=""
+fi
+
+info()  { printf '%s==>%s %s\n' "$C_CYAN$C_BOLD" "$C_RESET" "$*"; }
+ok()    { printf '%s ✓%s  %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn()  { printf '%s !%s  %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()   { printf '%s ✗%s  %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+die()   { err "$*"; notify "$*"; exit 1; }
+have()  { command -v "$1" >/dev/null 2>&1; }
+
+# Show a desktop notification when we were started from the app menu
+# (no terminal to print errors to).
+notify() {
+    [[ -t 2 ]] && return 0
+    have notify-send && notify-send -i xwaydroid "xWaydroid" "$*" 2>/dev/null || true
+}
+
+# Run a command as root: sudo in a terminal, pkexec from the desktop.
+as_root() {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
+    elif [[ -t 0 ]] && have sudo; then
+        sudo "$@"
+    elif have pkexec; then
+        pkexec "$@"
+    elif have sudo; then
+        sudo "$@"
+    else
+        die "Need root for: $* (install sudo or polkit)"
+    fi
+}
+
+confirm() {
+    local reply
+    [[ "${XWAYDROID_YES:-0}" == 1 ]] && return 0
+    [[ -r /dev/tty ]] || return 0
+    printf '%s?%s %s [Y/n] ' "$C_BOLD" "$C_RESET" "$1" > /dev/tty
+    read -r reply < /dev/tty || return 0
+    [[ -z "$reply" || "$reply" =~ ^[Yy] ]]
+}
+
+# ---------------------------------------------------------------------------
+# Dependency installation
+# ---------------------------------------------------------------------------
+detect_pm() {
+    local pm
+    for pm in dnf apt-get pacman zypper xbps-install apk eopkg; do
+        have "$pm" && { echo "$pm"; return; }
+    done
+    echo unknown
+}
+
+waydroid_initialized() { [[ -f /var/lib/waydroid/waydroid.cfg ]]; }
+
+install_packages() {
+    local pm; pm="$(detect_pm)"
+    info "Installing requirements with $pm: waydroid, weston, wl-clipboard"
+    case "$pm" in
+        dnf)
+            as_root dnf install -y waydroid weston wl-clipboard ;;
+        apt-get)
+            as_root apt-get update
+            as_root apt-get install -y weston wl-clipboard curl ca-certificates lsb-release
+            if ! apt-cache show waydroid >/dev/null 2>&1; then
+                info "Adding the official Waydroid apt repository (repo.waydro.id)"
+                curl -fsSL https://repo.waydro.id | as_root bash || die "Could not add the Waydroid repository"
+            fi
+            as_root apt-get install -y waydroid ;;
+        pacman)
+            as_root pacman -S --needed --noconfirm weston wl-clipboard
+            if ! have waydroid; then
+                if ! as_root pacman -S --needed --noconfirm waydroid 2>/dev/null; then
+                    if   have yay;  then yay  -S --needed --noconfirm waydroid
+                    elif have paru; then paru -S --needed --noconfirm waydroid
+                    else die "waydroid is in the AUR: install it with an AUR helper (yay -S waydroid) and rerun"
+                    fi
+                fi
+            fi ;;
+        zypper)
+            as_root zypper --non-interactive install waydroid weston wl-clipboard ;;
+        xbps-install)
+            as_root xbps-install -Sy waydroid weston wl-clipboard ;;
+        apk)
+            as_root apk add waydroid weston weston-backend-x11 weston-shell-kiosk wl-clipboard ;;
+        eopkg)
+            as_root eopkg install -y waydroid weston wl-clipboard ;;
+        *)
+            if [[ -e /etc/NIXOS ]]; then
+                die "On NixOS add 'virtualisation.waydroid.enable = true;' and 'weston' to your configuration, then rebuild"
+            fi
+            die "Unsupported package manager. Install waydroid, weston and wl-clipboard manually, then rerun" ;;
+    esac
+}
+
+cmd_setup() {
+    local image_type="VANILLA"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --gapps) image_type="GAPPS" ;;
+            -y|--yes) XWAYDROID_YES=1 ;;
+            *) die "Unknown setup option: $1" ;;
+        esac
+        shift
+    done
+
+    info "xWaydroid setup"
+    if have waydroid && have weston; then
+        ok "waydroid and weston are already installed"
+        have wl-copy || warn "wl-clipboard not found: clipboard sharing with Android will not work"
+    else
+        confirm "Install missing packages (waydroid, weston, wl-clipboard)?" || die "Aborted"
+        install_packages
+        have waydroid || die "waydroid is still not installed"
+        have weston   || die "weston is still not installed"
+        ok "Packages installed"
+    fi
+
+    if waydroid_initialized; then
+        ok "Waydroid images are already initialized"
+    else
+        confirm "Download and initialize Waydroid Android images ($image_type, about 1 GB)?" || die "Aborted"
+        as_root waydroid init -s "$image_type" || die "waydroid init failed"
+        ok "Waydroid initialized"
+    fi
+
+    if have systemctl; then
+        if ! systemctl is-enabled --quiet waydroid-container 2>/dev/null || \
+           ! systemctl is-active  --quiet waydroid-container 2>/dev/null; then
+            info "Enabling waydroid-container service"
+            as_root systemctl enable --now waydroid-container || warn "Could not enable waydroid-container"
+        fi
+        ok "waydroid-container service is running"
+    fi
+
+    ok "Setup complete. Run '$PROG' to start Android."
+}
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+cmd_doctor() {
+    local bad=0
+    info "xWaydroid $VERSION diagnostics"
+    printf '    session type : %s\n' "${XDG_SESSION_TYPE:-unknown}"
+    printf '    DISPLAY      : %s\n' "${DISPLAY:-<unset>}"
+    printf '    WAYLAND      : %s\n' "${WAYLAND_DISPLAY:-<unset>}"
+    printf '    distro pm    : %s\n' "$(detect_pm)"
+
+    [[ -n "${DISPLAY:-}" ]] && ok "X11 display available" || { err "No X11 DISPLAY"; bad=1; }
+    have weston   && ok "weston $(weston --version 2>/dev/null | awk '{print $2}')" || { err "weston missing"; bad=1; }
+    have waydroid && ok "waydroid $(waydroid --version 2>/dev/null)" || { err "waydroid missing"; bad=1; }
+    have wl-copy  && ok "wl-clipboard (clipboard sharing)" || warn "wl-clipboard missing (optional)"
+    waydroid_initialized && ok "Waydroid images initialized" || { err "Waydroid not initialized (run: $PROG setup)"; bad=1; }
+
+    if have systemctl; then
+        systemctl is-active --quiet waydroid-container 2>/dev/null \
+            && ok "waydroid-container service active" \
+            || { warn "waydroid-container service not active (xwaydroid will try to start it)"; }
+    fi
+
+    if grep -qw binder /proc/filesystems 2>/dev/null || [[ -e /dev/binder || -d /dev/binderfs ]]; then
+        ok "Kernel binder support present"
+    elif modinfo binder_linux >/dev/null 2>&1; then
+        ok "binder_linux module available"
+    else
+        err "No binder support in this kernel (Waydroid needs binder: try linux-zen or the binder_linux DKMS module)"
+        bad=1
+    fi
+
+    local mod_dir found=0
+    for mod_dir in /usr/lib64/libweston-* /usr/lib/libweston-* /usr/lib/*/libweston-*; do
+        [[ -e "$mod_dir/x11-backend.so" ]] && found=1
+    done
+    [[ $found == 1 ]] && ok "weston X11 backend installed" || warn "Could not find weston x11-backend.so (may live elsewhere)"
+
+    have waydroid && waydroid status 2>/dev/null | sed 's/^/    /'
+    return $bad
+}
+
+# ---------------------------------------------------------------------------
+# Launch
+# ---------------------------------------------------------------------------
+WESTON_PID=""
+SESSION_PID=""
+
+session_running() { waydroid status 2>/dev/null | grep -q 'Session:[[:space:]]*RUNNING'; }
+
+cleanup() {
+    trap - EXIT INT TERM
+    if [[ "$STOP_ON_EXIT" == 1 ]] && have waydroid; then
+        waydroid session stop >/dev/null 2>&1 || true
+    fi
+    [[ -n "$SESSION_PID" ]] && kill "$SESSION_PID" 2>/dev/null
+    [[ -n "$WESTON_PID" ]]  && kill "$WESTON_PID"  2>/dev/null
+    wait 2>/dev/null
+}
+
+ensure_container() {
+    have systemctl || return 0
+    systemctl is-active --quiet waydroid-container 2>/dev/null && return 0
+    info "Starting waydroid-container service"
+    as_root systemctl start waydroid-container || die "Could not start waydroid-container service"
+}
+
+start_weston() {
+    local runtime="$XDG_RUNTIME_DIR"
+    local args=(--backend=x11-backend.so --socket="$SOCKET_NAME" --idle-time=0)
+
+    case "$WESTON_SHELL" in
+        kiosk)   args+=(--shell=kiosk-shell.so) ;;
+        desktop) args+=(--shell=desktop-shell.so) ;;
+        *)       die "Unknown shell '$WESTON_SHELL' (use kiosk or desktop)" ;;
+    esac
+
+    if [[ "$FULLSCREEN" == 1 ]]; then
+        args+=(--fullscreen)
+    else
+        args+=(--width="$WIDTH" --height="$HEIGHT")
+    fi
+
+    if [[ "$RENDERER" == pixman ]]; then
+        if weston --help 2>&1 | grep -q -- '--renderer='; then
+            args+=(--renderer=pixman)
+        else
+            args+=(--use-pixman)
+        fi
+    fi
+
+    # A stale socket from a crashed run would make weston refuse to start.
+    if [[ -S "$runtime/$SOCKET_NAME" ]] && ! pgrep -u "$UID" -f -- "--socket=$SOCKET_NAME" >/dev/null; then
+        rm -f "$runtime/$SOCKET_NAME" "$runtime/$SOCKET_NAME.lock"
+    fi
+    if [[ -S "$runtime/$SOCKET_NAME" ]]; then
+        die "xWaydroid is already running (socket $runtime/$SOCKET_NAME in use). Use '$PROG stop' first."
+    fi
+
+    mkdir -p "$STATE_DIR"
+    info "Starting nested Weston (${WESTON_SHELL} shell, $([[ $FULLSCREEN == 1 ]] && echo fullscreen || echo "${WIDTH}x${HEIGHT}"))"
+    # Weston must not see an inherited WAYLAND_DISPLAY or it picks the wayland backend.
+    env -u WAYLAND_DISPLAY weston "${args[@]}" >"$LOG_FILE" 2>&1 &
+    WESTON_PID=$!
+
+    local i
+    for ((i = 0; i < 100; i++)); do
+        [[ -S "$runtime/$SOCKET_NAME" ]] && return 0
+        kill -0 "$WESTON_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    err "Weston failed to start. Last lines of $LOG_FILE:"
+    tail -n 15 "$LOG_FILE" >&2
+    die "Weston failed to start (try: $PROG --software)"
+}
+
+start_android() {
+    export WAYLAND_DISPLAY="$SOCKET_NAME"
+    export XDG_SESSION_TYPE=wayland
+
+    # A session started earlier is bound to another (or no) Wayland display.
+    if session_running; then
+        info "Restarting existing Waydroid session on the new display"
+        waydroid session stop >/dev/null 2>&1 || true
+        sleep 1
+    fi
+
+    info "Starting Waydroid session"
+    waydroid session start >>"$STATE_DIR/session.log" 2>&1 &
+    SESSION_PID=$!
+
+    local i
+    for ((i = 0; i < 120; i++)); do
+        session_running && break
+        kill -0 "$SESSION_PID" 2>/dev/null || { tail -n 15 "$STATE_DIR/session.log" >&2; die "Waydroid session failed to start"; }
+        kill -0 "$WESTON_PID"  2>/dev/null || die "Weston window was closed"
+        sleep 0.5
+    done
+    session_running || die "Timed out waiting for the Waydroid session"
+
+    if [[ -n "$APP" ]]; then
+        info "Launching $APP"
+        waydroid app launch "$APP" >/dev/null 2>&1 || warn "Could not launch $APP"
+    else
+        info "Opening Android full UI"
+        waydroid show-full-ui >/dev/null 2>&1 &
+    fi
+}
+
+cmd_run() {
+    have waydroid && have weston && waydroid_initialized || {
+        warn "Requirements are missing, running first-time setup"
+        cmd_setup
+    }
+
+    # Already on Wayland: nothing to nest, just open Waydroid.
+    if [[ -n "${WAYLAND_DISPLAY:-}" && "${XDG_SESSION_TYPE:-}" == wayland ]]; then
+        info "Wayland session detected, launching Waydroid directly"
+        ensure_container
+        if [[ -n "$APP" ]]; then exec waydroid app launch "$APP"; fi
+        exec waydroid show-full-ui
+    fi
+
+    [[ -n "${DISPLAY:-}" ]] || die "No X11 DISPLAY found. Run xwaydroid from inside your X11 desktop session."
+    [[ -n "${XDG_RUNTIME_DIR:-}" ]] || export XDG_RUNTIME_DIR="/run/user/$UID"
+
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM
+
+    ensure_container
+    start_weston
+    start_android
+
+    ok "Android is running. Close the Weston window to stop it."
+    wait "$WESTON_PID" 2>/dev/null
+    info "Weston closed, shutting down"
+}
+
+cmd_stop() {
+    info "Stopping xWaydroid"
+    have waydroid && waydroid session stop >/dev/null 2>&1
+    pkill -u "$UID" -f -- "--socket=$SOCKET_NAME" 2>/dev/null
+    ok "Stopped"
+}
+
+usage() {
+    cat <<EOF
+${C_BOLD}xwaydroid $VERSION${C_RESET} - run Waydroid on any X11 desktop
+
+${C_BOLD}Usage:${C_RESET}
+  $PROG [options]            Start Android in a window (default)
+  $PROG setup [--gapps]      Install requirements and initialize Waydroid
+  $PROG stop                 Stop Android and close the window
+  $PROG doctor               Check that everything is set up correctly
+  $PROG --version | --help
+
+${C_BOLD}Options:${C_RESET}
+  -W, --width N        Window width  (default $WIDTH)
+  -H, --height N       Window height (default $HEIGHT)
+  -f, --fullscreen     Run fullscreen
+  -a, --app PACKAGE    Launch a single app instead of the full UI
+                       (e.g. org.mozilla.firefox)
+      --desktop-shell  Use Weston's desktop shell instead of kiosk
+      --software       Use the CPU renderer (fixes black screens on some GPUs)
+      --keep-running   Keep the Android session alive after closing the window
+  -y, --yes            Answer yes to all setup prompts
+
+${C_BOLD}Config:${C_RESET} $CONFIG_FILE
+  WIDTH=1280  HEIGHT=800  FULLSCREEN=0  WESTON_SHELL=kiosk
+  RENDERER=auto  STOP_ON_EXIT=1
+
+More help: $REPO_URL
+EOF
+}
+
+main() {
+    local cmd="run"
+    case "${1:-}" in
+        setup|install) shift; cmd_setup "$@"; return ;;
+        doctor|check)  shift; cmd_doctor; return ;;
+        stop)          shift; cmd_stop; return ;;
+        run|start)     shift ;;
+    esac
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -W|--width)      WIDTH="${2:?--width needs a value}"; shift ;;
+            -H|--height)     HEIGHT="${2:?--height needs a value}"; shift ;;
+            -f|--fullscreen) FULLSCREEN=1 ;;
+            -a|--app)        APP="${2:?--app needs a package name}"; shift ;;
+            --desktop-shell) WESTON_SHELL=desktop ;;
+            --software)      RENDERER=pixman ;;
+            --keep-running)  STOP_ON_EXIT=0 ;;
+            -y|--yes)        XWAYDROID_YES=1 ;;
+            -v|--version)    echo "$PROG $VERSION"; return ;;
+            -h|--help)       usage; return ;;
+            *)               err "Unknown option: $1"; usage >&2; return 2 ;;
+        esac
+        shift
+    done
+
+    [[ "$WIDTH"  =~ ^[0-9]+$ ]] || die "Width must be a number"
+    [[ "$HEIGHT" =~ ^[0-9]+$ ]] || die "Height must be a number"
+    "cmd_$cmd"
+}
+
+main "$@"
