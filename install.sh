@@ -49,8 +49,12 @@ ICON_DIR="$DATA_DIR/icons/hicolor"
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 
 refresh_caches() {
-    command -v update-desktop-database >/dev/null && $SUDO update-desktop-database -q "$APP_DIR" 2>/dev/null || true
-    command -v gtk-update-icon-cache  >/dev/null && $SUDO gtk-update-icon-cache -q -t "$ICON_DIR" 2>/dev/null || true
+    if command -v update-desktop-database >/dev/null; then
+        $SUDO update-desktop-database -q "$APP_DIR" 2>/dev/null || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null; then
+        $SUDO gtk-update-icon-cache -q -t "$ICON_DIR" 2>/dev/null || true
+    fi
 }
 
 if [[ $UNINSTALL == 1 ]]; then
